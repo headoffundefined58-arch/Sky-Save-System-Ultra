@@ -1,0 +1,29 @@
+# ---- Build outputs ----
+build/
+build_ae/
+build_se/
+doctor/build/
+out/
+cmake-build-*/
+*.cmake
+
+# ---- Binaries / build artefacts (generated, never committed) ----
+*.dll
+*.exe
+*.pdb
+*.bak
+*.bak-*
+*.tmp
+.SSS-Ultra.tmp
+SSS-Ultra.fix
+SSS-Ultra.fix.status
+
+# ---- IDE ----
+.vs/
+*.user
+.idea/
+.vscode/
+
+# ---- OS ----
+Thumbs.db
+Desktop.ini

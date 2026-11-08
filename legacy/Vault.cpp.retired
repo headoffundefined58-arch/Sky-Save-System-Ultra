@@ -1,0 +1,950 @@
+#include "PCH.h"
+
+#include "Vault.h"
+#include "Ini.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <system_error>
+
+namespace S3U::Vault
+{
+	namespace
+	{
+		// 'SVLT' as a little-endian u32.  Also used as the co-save record type,
+		// so a stray record from another plugin can never be mistaken for ours.
+		constexpr std::uint32_t kMagic  = 'SVLT';
+		constexpr std::uint16_t kFormat = 2;
+
+		// A record is dropped, not fatal, when its length or CRC is wrong.  The
+		// headroom keeps a corrupt file from making us allocate gigabytes: no
+		// single key/value pair has any business being this large.
+		constexpr std::uint32_t kMaxRecord = 1024u * 1024u;
+		constexpr std::uint32_t kMaxCount  = 200000u;
+
+		std::unordered_map<std::string, Entry> s_live;
+		std::unordered_map<std::string, Entry> s_committed;
+		Status                                 s_status;
+		std::string                            s_identity;
+		std::uint64_t                          s_tx       = 0;
+		double                                 s_gameTime = 0.0;
+
+		// Directory keys and slot names come from a string the engine handed us
+		// or from a config file, so they are constrained to a safe alphabet
+		// before they ever become a path component.
+		std::string SanitizeKey(std::string_view a_key)
+		{
+			std::string out;
+			out.reserve(std::min<std::size_t>(a_key.size(), 64));
+			for (unsigned char c : a_key) {
+				if (out.size() >= 64) {
+					break;
+				}
+				if (std::isalnum(c) || c == '-' || c == '_') {
+					out.push_back(static_cast<char>(c));
+				}
+			}
+			return out;
+		}
+
+		std::filesystem::path VaultRoot()
+		{
+			return Paths::EnsureDataDir() / "Vault";
+		}
+
+		std::filesystem::path CharDir()
+		{
+			if (s_identity.empty()) {
+				return {};
+			}
+			return VaultRoot() / s_identity;
+		}
+
+		std::string Stamp()
+		{
+			std::time_t now = std::time(nullptr);
+			std::tm     tm{};
+			localtime_s(&tm, &now);
+			char buffer[32]{};
+			std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", &tm);
+			return buffer;
+		}
+
+		// An atomic replace in the sense that matters: the target file is either
+		// the complete old version or the complete new one, never a half-written
+		// mixture.  The temporary lives next to the target on purpose, so the
+		// rename stays on one volume and therefore stays atomic.
+		//
+		// On Windows std::filesystem::rename maps to MoveFileExW with
+		// MOVEFILE_REPLACE_EXISTING, so replacing an existing slot is atomic.
+		// The previous version of this function "recovered" a failed rename by
+		// remove(target) + rename, which destroys the last good slot *before*
+		// the replacement is in place - exactly the loss the two-slot design
+		// exists to prevent.  A rename failure now leaves the old slot intact:
+		// the worst outcome is a stale-but-valid state, never a missing one.
+		bool WriteFileAtomic(const std::filesystem::path& a_target,
+			const void*                          a_data,
+			std::size_t                          a_len,
+			std::string&                         a_note)
+		{
+			std::error_code ec;
+			std::filesystem::create_directories(a_target.parent_path(), ec);
+
+			auto temp = a_target;
+			temp += ".tmp";
+
+			{
+				std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+				if (!out.is_open()) {
+					a_note = "cannot open " + temp.string();
+					return false;
+				}
+				out.write(static_cast<const char*>(a_data), static_cast<std::streamsize>(a_len));
+				out.flush();
+				if (!out) {
+					a_note = "short write to " + temp.string();
+					return false;
+				}
+			}
+
+			std::filesystem::rename(temp, a_target, ec);
+			if (ec) {
+				// Rename failed.  The target is still the previous good version;
+				// the only thing to clean up is our own temp.  Removing the
+				// target to "make room" would be destroying the data we are here
+				// to protect.
+				a_note = "rename failed: " + ec.message();
+				std::filesystem::remove(temp, ec);
+				return false;
+			}
+			return true;
+		}
+
+		bool ReadFile(const std::filesystem::path& a_path, std::vector<std::uint8_t>& a_out, std::string& a_note)
+		{
+			std::error_code ec;
+			if (!std::filesystem::is_regular_file(a_path, ec)) {
+				a_note = "missing";
+				return false;
+			}
+			const auto size = std::filesystem::file_size(a_path, ec);
+			if (ec || size < 16 || size > 64ull * 1024ull * 1024ull) {
+				a_note = "implausible size";
+				return false;
+			}
+
+			std::ifstream in(a_path, std::ios::binary);
+			if (!in.is_open()) {
+				a_note = "cannot open";
+				return false;
+			}
+			a_out.resize(static_cast<std::size_t>(size));
+			in.read(reinterpret_cast<char*>(a_out.data()), static_cast<std::streamsize>(size));
+			if (in.gcount() != static_cast<std::streamsize>(size)) {
+				a_note = "short read";
+				return false;
+			}
+			return true;
+		}
+
+		// ---- manifest ---------------------------------------------------------
+		// Deliberately plain text: when something goes wrong the user (and I)
+		// need to be able to read the commit history without a hex editor.
+		struct Manifest
+		{
+			std::uint64_t tx{ 0 };
+			bool          activeIsB{ false };
+			std::uint64_t txA{ 0 };
+			std::uint64_t txB{ 0 };
+			std::uint32_t sizeA{ 0 };
+			std::uint32_t sizeB{ 0 };
+			std::uint32_t crcA{ 0 };
+			std::uint32_t crcB{ 0 };
+			std::string   stampA;
+			std::string   stampB;
+			bool          valid{ false };
+		};
+
+		std::filesystem::path ManifestPath() { return CharDir() / "manifest.txt"; }
+
+		Manifest ReadManifest()
+		{
+			Manifest m;
+			std::ifstream in(ManifestPath());
+			if (!in.is_open()) {
+				return m;
+			}
+
+			std::string line;
+			int         headerSeen = 0;
+			while (std::getline(in, line)) {
+				if (line.rfind("SaveVault ", 0) == 0) {
+					headerSeen = 1;
+					continue;
+				}
+				if (line.rfind("tx ", 0) == 0) {
+					m.tx = std::strtoull(line.c_str() + 3, nullptr, 10);
+				} else if (line.rfind("active ", 0) == 0) {
+					m.activeIsB = (line.size() > 7 && (line[7] == 'b' || line[7] == 'B'));
+				} else if (line.rfind("a ", 0) == 0 || line.rfind("b ", 0) == 0) {
+					const bool     isA = (line[0] == 'a');
+					std::uint64_t  tx = 0;
+					unsigned long  size = 0;
+					unsigned long  crc = 0;
+					char           stamp[40]{};
+					if (std::sscanf(line.c_str() + 2, "%llu %lu %lx %39s",
+							&tx, &size, &crc, stamp) == 4) {
+						if (isA) {
+							m.txA = tx; m.sizeA = size; m.crcA = crc; m.stampA = stamp;
+						} else {
+							m.txB = tx; m.sizeB = size; m.crcB = crc; m.stampB = stamp;
+						}
+					}
+				}
+			}
+			m.valid = headerSeen != 0 && m.tx != 0;
+			return m;
+		}
+
+		void WriteManifest(const Manifest& a_manifest)
+		{
+			char body[512]{};
+			std::snprintf(body, sizeof(body),
+				"SaveVault 2\n"
+				"tx %llu\n"
+				"active %c\n"
+				"a %llu %u %08x %s\n"
+				"b %llu %u %08x %s\n",
+				static_cast<unsigned long long>(a_manifest.tx),
+				a_manifest.activeIsB ? 'b' : 'a',
+				static_cast<unsigned long long>(a_manifest.txA),
+				a_manifest.sizeA, a_manifest.crcA, a_manifest.stampA.c_str(),
+				static_cast<unsigned long long>(a_manifest.txB),
+				a_manifest.sizeB, a_manifest.crcB, a_manifest.stampB.c_str());
+
+			std::string note;
+			WriteFileAtomic(ManifestPath(), body, std::strlen(body), note);
+		}
+
+		std::filesystem::path SlotPath(bool a_slotB)
+		{
+			return CharDir() / (a_slotB ? "slot-b.bin" : "slot-a.bin");
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	const Status& Last()
+	{
+		s_status.entries = s_live.size();
+		s_status.tx      = s_tx;
+		return s_status;
+	}
+
+	void Reset()
+	{
+		s_live.clear();
+		s_committed.clear();
+		s_tx = 0;
+		s_status = Status{};
+		s_status.identity = s_identity;
+	}
+
+	void ObserveSaveName(const char* a_fileName)
+	{
+		if (!a_fileName) {
+			return;
+		}
+
+		std::string name{ a_fileName };
+		if (name.size() < 4 || name.size() > 300) {
+			return;
+		}
+		for (unsigned char c : name) {
+			if (c < 0x20 || c >= 0x7F) {
+				return;
+			}
+		}
+
+		const auto stem = std::filesystem::path{ name }.stem().string();
+
+		// "Save1_D46E04D7_0_...": field 1 is the engine's per-character hash.
+		// It is stable for one character across every save it ever writes, which
+		// is exactly the key a per-character vault needs.
+		std::vector<std::string> parts;
+		std::size_t              start = 0;
+		for (std::size_t i = 0; i <= stem.size(); ++i) {
+			if (i == stem.size() || stem[i] == '_') {
+				parts.emplace_back(stem.substr(start, i - start));
+				start = i + 1;
+			}
+			if (parts.size() > 4) {
+				break;
+			}
+		}
+
+		if (parts.size() >= 2 && parts[1].size() == 8) {
+			const bool hex = std::all_of(parts[1].begin(), parts[1].end(),
+				[](unsigned char c) { return std::isxdigit(c) != 0; });
+			if (hex) {
+				const auto key = SanitizeKey(parts[1]);
+				if (!key.empty() && key != s_identity) {
+					s_identity       = key;
+					s_status.identity = key;
+				}
+				return;
+			}
+		}
+
+		if (s_identity.empty()) {
+			s_identity        = "default";
+			s_status.identity = s_identity;
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	namespace
+	{
+		Entry* Find(std::string_view a_key)
+		{
+			auto it = s_live.find(std::string{ a_key });
+			return it == s_live.end() ? nullptr : &it->second;
+		}
+
+		const Entry* FindConst(std::string_view a_key)
+		{
+			auto it = s_live.find(std::string{ a_key });
+			return it == s_live.end() ? nullptr : &it->second;
+		}
+	}
+
+	bool SetInt(std::string_view a_key, std::int64_t a_value)
+	{
+		if (a_key.empty()) {
+			return false;
+		}
+		Entry e;
+		e.type = Type::kInt;
+		e.i    = a_value;
+		s_live[std::string{ a_key }] = std::move(e);
+		return true;
+	}
+
+	bool SetFloat(std::string_view a_key, double a_value)
+	{
+		if (a_key.empty()) {
+			return false;
+		}
+		Entry e;
+		e.type = Type::kFloat;
+		e.f    = a_value;
+		s_live[std::string{ a_key }] = std::move(e);
+		return true;
+	}
+
+	bool SetBool(std::string_view a_key, bool a_value)
+	{
+		if (a_key.empty()) {
+			return false;
+		}
+		Entry e;
+		e.type = Type::kBool;
+		e.i    = a_value ? 1 : 0;
+		s_live[std::string{ a_key }] = std::move(e);
+		return true;
+	}
+
+	bool SetString(std::string_view a_key, std::string_view a_value)
+	{
+		if (a_key.empty()) {
+			return false;
+		}
+		Entry e;
+		e.type = Type::kString;
+		e.s    = std::string{ a_value };
+		s_live[std::string{ a_key }] = std::move(e);
+		return true;
+	}
+
+	bool SetForm(std::string_view a_key, const RE::TESForm* a_form)
+	{
+		if (a_key.empty()) {
+			return false;
+		}
+		Entry e;
+		e.type = Type::kForm;
+		e.form = MakeFormRef(a_form);
+		s_live[std::string{ a_key }] = std::move(e);
+		return true;
+	}
+
+	bool GetInt(std::string_view a_key, std::int64_t& a_value)
+	{
+		const auto* e = FindConst(a_key);
+		if (!e || e->type != Type::kInt) {
+			return false;
+		}
+		a_value = e->i;
+		return true;
+	}
+
+	bool GetFloat(std::string_view a_key, double& a_value)
+	{
+		const auto* e = FindConst(a_key);
+		if (!e || e->type != Type::kFloat) {
+			return false;
+		}
+		a_value = e->f;
+		return true;
+	}
+
+	bool GetBool(std::string_view a_key, bool& a_value)
+	{
+		const auto* e = FindConst(a_key);
+		if (!e || e->type != Type::kBool) {
+			return false;
+		}
+		a_value = e->i != 0;
+		return true;
+	}
+
+	bool GetString(std::string_view a_key, std::string& a_value)
+	{
+		const auto* e = FindConst(a_key);
+		if (!e || e->type != Type::kString) {
+			return false;
+		}
+		a_value = e->s;
+		return true;
+	}
+
+	RE::TESForm* GetForm(std::string_view a_key)
+	{
+		const auto* e = FindConst(a_key);
+		if (!e || e->type != Type::kForm) {
+			return nullptr;
+		}
+		// One choke point for every form handed back to game code.  It cannot
+		// return a pointer that is not live right now.
+		return e->form.Resolve();
+	}
+
+	bool Has(std::string_view a_key)
+	{
+		return Find(a_key) != nullptr;
+	}
+
+	bool Erase(std::string_view a_key)
+	{
+		return s_live.erase(std::string{ a_key }) != 0;
+	}
+
+	// -------------------------------------------------------------------------
+	// Encoding
+	//
+	// Layout: header, then a sequence of independently checksummed records,
+	// then one checksum over everything before it.
+	//
+	// The per-record checksum is what makes a damaged file a partial loss
+	// instead of a total one: a record whose bytes do not add up is skipped and
+	// counted, and the session carries on with the rest.  Compare that with the
+	// engine's image, where a single wrong length disables the whole save.
+	// -------------------------------------------------------------------------
+	std::vector<std::uint8_t> SerializeWithTx(std::uint64_t a_tx)
+	{
+		Codec::Writer out;
+		out.U32(kMagic);
+		out.U16(kFormat);
+		out.U16(0);
+		out.U64(a_tx);
+		out.F64(s_gameTime);
+		const auto countOffset = out.Size();
+		out.U32(0);  // placeholder; overwritten with the true count below
+		// The header count must equal the number of records actually written.
+		// kMaxCount is a *read-side* safety cap; the write side must never emit
+		// more records than the header promises, or the decoder stops after the
+		// declared count and everything past it becomes a trailing-CRC mismatch.
+		// (In practice the vault holds a handful of keys, but the invariant is
+		// what keeps the format self-consistent under any load.)
+		std::uint32_t written = 0;
+		for (const auto& [key, entry] : s_live) {
+			if (written >= kMaxCount) {
+				break;
+			}
+			Codec::Writer rec;
+			rec.Str(key);
+			rec.U8(static_cast<std::uint8_t>(entry.type));
+
+			switch (entry.type) {
+			case Type::kInt:
+				rec.U64(static_cast<std::uint64_t>(entry.i));
+				break;
+			case Type::kFloat:
+				rec.F64(entry.f);
+				break;
+			case Type::kBool:
+				rec.U8(entry.i != 0 ? 1 : 0);
+				break;
+			case Type::kString:
+				rec.Str(entry.s);
+				break;
+			case Type::kForm:
+				rec.Str(entry.form.plugin);
+				rec.U32(entry.form.localID);
+				rec.U32(entry.form.runtimeIDAtSave);
+				break;
+			default:
+				continue;
+			}
+
+			const auto size = static_cast<std::uint32_t>(rec.Size());
+			out.U32(size);
+			out.Raw(rec.Data().data(), size);
+			out.U32(Codec::Crc32(rec.Data().data(), size));
+			++written;
+		}
+		out.OverwriteU32(countOffset, written);
+
+		const auto bodyCrc = Codec::Crc32(out.Data().data(), out.Size());
+		out.U32(bodyCrc);
+		return out.Data();
+	}
+
+	// Public entry point: serialise the live table under the current commit
+	// number.  Used by the co-save path, where the tx was already fixed by an
+	// earlier Commit.
+	std::vector<std::uint8_t> Serialize()
+	{
+		return SerializeWithTx(s_tx);
+	}
+
+	namespace
+	{
+		using Table = std::unordered_map<std::string, Entry>;
+
+		bool Decode(const void*            a_data,
+			std::size_t                   a_len,
+			Table&                        a_out,
+			std::uint64_t&                a_txOut,
+			double&                       a_gameTimeOut,
+			std::size_t&                  a_dropped,
+			std::string&                  a_note)
+		{
+			a_out.clear();
+			a_dropped = 0;
+
+			if (!a_data || a_len < 20) {
+				a_note = "block too small";
+				return false;
+			}
+
+			Codec::Reader r(a_data, a_len);
+			if (r.U32() != kMagic) {
+				a_note = "magic mismatch";
+				return false;
+			}
+			const auto format = r.U16();
+			r.U16();
+			if (format < 1 || format > kFormat) {
+				a_note = "unsupported format " + std::to_string(format);
+				return false;
+			}
+			a_txOut        = r.U64();
+			a_gameTimeOut  = r.F64();
+			const auto count = r.U32();
+			if (!r.Ok() || count > kMaxCount) {
+				a_note = "implausible record count";
+				return false;
+			}
+
+			for (std::uint32_t i = 0; i < count && r.Ok(); ++i) {
+				const auto size = r.U32();
+				if (!r.Ok() || size == 0 || size > kMaxRecord || size > r.Remaining()) {
+					a_note = "record length out of range";
+					return false;
+				}
+
+				std::vector<std::uint8_t> payload(size);
+				if (!r.Raw(payload.data(), size)) {
+					a_note = "truncated record";
+					return false;
+				}
+				const auto crc = r.U32();
+				if (!r.Ok()) {
+					a_note = "truncated checksum";
+					return false;
+				}
+
+				if (Codec::Crc32(payload.data(), size) != crc) {
+					++a_dropped;  // this record is lost, the rest is not
+					continue;
+				}
+
+				Codec::Reader rr(payload.data(), payload.size());
+				auto           key = rr.Str();
+				const auto     type = static_cast<Type>(rr.U8());
+				if (!rr.Ok() || key.empty()) {
+					++a_dropped;
+					continue;
+				}
+
+				Entry entry;
+				entry.type = type;
+				switch (type) {
+				case Type::kInt:
+					entry.i = static_cast<std::int64_t>(rr.U64());
+					break;
+				case Type::kFloat:
+					entry.f = rr.F64();
+					break;
+				case Type::kBool:
+					entry.i = rr.U8() != 0 ? 1 : 0;
+					break;
+				case Type::kString:
+					entry.s = rr.Str();
+					break;
+				case Type::kForm:
+					entry.form.plugin          = rr.Str();
+					entry.form.localID        = rr.U32();
+					entry.form.runtimeIDAtSave = rr.U32();
+					break;
+				default:
+					++a_dropped;
+					continue;
+				}
+
+				if (!rr.Ok()) {
+					++a_dropped;
+					continue;
+				}
+
+				a_out[std::move(key)] = std::move(entry);
+			}
+
+			// The trailing checksum is advisory: records that already passed
+			// their own CRC are trusted even when it does not match, because a
+			// truncated tail should cost the tail and nothing else.
+			if (a_len >= 4) {
+				std::uint32_t stored = 0;
+				std::memcpy(&stored,
+					static_cast<const std::uint8_t*>(a_data) + a_len - 4, sizeof(stored));
+				if (Codec::Crc32(a_data, a_len - 4) != stored) {
+					a_note = "trailing checksum mismatch (records still trusted individually)";
+				}
+			}
+
+			return true;
+		}
+	}
+
+	bool Deserialize(const void* a_data, std::size_t a_len, std::string& a_note)
+	{
+		Table         parsed;
+		std::uint64_t tx    = 0;
+		double        gt    = 0.0;
+		std::size_t   drops = 0;
+
+		if (!Decode(a_data, a_len, parsed, tx, gt, drops, a_note)) {
+			return false;
+		}
+
+		s_live          = std::move(parsed);
+		s_tx            = tx;
+		s_gameTime      = gt;
+		s_status.droppedRecords = drops;
+		return true;
+	}
+
+	// -------------------------------------------------------------------------
+	// Commit
+	// -------------------------------------------------------------------------
+	void PruneHistory(const std::filesystem::path& a_dir, std::size_t a_keep);
+
+	void Commit()
+	{
+		if (!Ini::Get().vaultEnabled) {
+			return;
+		}
+		if (s_identity.empty()) {
+			s_identity        = "default";
+			s_status.identity = s_identity;
+		}
+
+		const auto dir = CharDir();
+		if (dir.empty()) {
+			return;
+		}
+
+		std::error_code ec;
+		std::filesystem::create_directories(dir, ec);
+
+		// The transaction number is the identity of the snapshot being written.
+		// It must only advance once the snapshot is actually on disk, otherwise
+		// a serialise/write failure leaves the in-memory counter one ahead of
+		// what the vault holds and the next commit "jumps" a generation.  The
+		// old code did ++s_tx before Serialize(), which is exactly that bug.
+		const auto nextTx = s_tx + 1;
+
+		const auto buffer = SerializeWithTx(nextTx);
+		if (buffer.empty()) {
+			spdlog::error("[Vault] serialisation produced nothing; commit skipped");
+			return;
+		}
+
+		// Checksum the body, not the whole file.  The last four bytes are the
+		// body's own CRC, and CRC32 has a fixed residue: hashing a complete,
+		// well-formed file always yields 0x2144DF1C.  Storing that in the
+		// manifest is technically right but useless for a human reading it -
+		// every healthy slot would print the same number.  The body CRC is
+		// what actually differs between two snapshots, and it still catches
+		// damage anywhere, because damage to the trailer changes it too.
+		const auto   crc      = Codec::Crc32(buffer.data(), buffer.size() - 4);
+		const auto   manifest = ReadManifest();
+		const bool   writeB   = manifest.valid ? !manifest.activeIsB : false;
+
+		std::string note;
+		if (!WriteFileAtomic(SlotPath(writeB), buffer.data(), buffer.size(), note)) {
+			spdlog::error("[Vault] slot write failed: {}", note);
+			return;
+		}
+
+		Manifest next = manifest;
+		next.tx        = nextTx;
+		next.activeIsB = writeB;
+		if (writeB) {
+			next.txB    = nextTx;
+			next.sizeB  = static_cast<std::uint32_t>(buffer.size());
+			next.crcB   = crc;
+			next.stampB = Stamp();
+		} else {
+			next.txA    = nextTx;
+			next.sizeA  = static_cast<std::uint32_t>(buffer.size());
+			next.crcA   = crc;
+			next.stampA = Stamp();
+		}
+		if (next.stampA.empty()) {
+			next.stampA = "-";
+		}
+		if (next.stampB.empty()) {
+			next.stampB = "-";
+		}
+
+		// The manifest is the commit point: until it names the new slot, the
+		// previous slot is still the authoritative one.  A crash on either side
+		// of this single atomic rename therefore leaves a consistent vault.
+		WriteManifest(next);
+
+		// Only now that everything is durable do we promote the in-memory
+		// state to match what the disk records.
+		s_tx       = nextTx;
+		s_committed = s_live;
+
+		// Generation history, so "the last three saves" is a real rollback
+		// window rather than a single previous state.
+		const auto history = dir / "history";
+		std::filesystem::create_directories(history, ec);
+		char name[64]{};
+		std::snprintf(name, sizeof(name), "tx-%08llu.bin",
+			static_cast<unsigned long long>(s_tx));
+		std::string historyNote;
+		WriteFileAtomic(history / name, buffer.data(), buffer.size(), historyNote);
+
+		PruneHistory(history, static_cast<std::size_t>(std::max(1, Ini::Get().vaultHistory)));
+
+		spdlog::info("[Vault] committed tx={} ({} entries, {} bytes, slot {})",
+			s_tx, s_live.size(), buffer.size(), writeB ? "b" : "a");
+	}
+
+	void PruneHistory(const std::filesystem::path& a_dir, std::size_t a_keep)
+	{
+		std::error_code ec;
+		std::vector<std::pair<std::uint64_t, std::filesystem::path>> files;
+
+		for (const auto& entry : std::filesystem::directory_iterator(a_dir, ec)) {
+			if (ec) {
+				break;
+			}
+			const auto name = entry.path().filename().string();
+			if (name.rfind("tx-", 0) != 0) {
+				continue;
+			}
+			const auto number = std::strtoull(name.c_str() + 3, nullptr, 10);
+			files.emplace_back(number, entry.path());
+		}
+
+		if (files.size() <= a_keep) {
+			return;
+		}
+		std::sort(files.begin(), files.end(),
+			[](const auto& a, const auto& b) { return a.first > b.first; });
+		for (std::size_t i = a_keep; i < files.size(); ++i) {
+			std::filesystem::remove(files[i].second, ec);
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// SKSE callbacks
+	// -------------------------------------------------------------------------
+	void OnSave(SKSE::SerializationInterface* a_intfc)
+	{
+		if (!a_intfc || !Ini::Get().vaultEnabled) {
+			return;
+		}
+
+		const auto buffer = Serialize();
+		if (buffer.empty()) {
+			spdlog::error("[Vault] nothing to write to co-save");
+			return;
+		}
+
+		// Only this record type is ours; every other plugin's co-save data is
+		// untouched.  That is the whole containment argument for putting state
+		// here instead of into the engine image.
+		if (!a_intfc->WriteRecord(kMagic, kFormat,
+				buffer.data(), static_cast<std::uint32_t>(buffer.size()))) {
+			spdlog::error("[Vault] co-save write failed ({} bytes)", buffer.size());
+			return;
+		}
+		spdlog::info("[Vault] co-save written: tx={} {} bytes", s_tx, buffer.size());
+	}
+
+	std::uint32_t RecordType()
+	{
+		return kMagic;
+	}
+
+	void OnLoadRecord(const void* a_data, std::size_t a_len)
+	{
+		const auto started = std::chrono::steady_clock::now();
+
+		s_live.clear();
+		s_committed.clear();
+		s_tx = 0;
+		s_status = Status{};
+		s_status.identity = s_identity;
+
+		Table         fromCosave;
+		std::uint64_t cosaveTx = 0;
+		double        cosaveGt = 0.0;
+		std::size_t   cosaveDrops = 0;
+		std::string   cosaveNote;
+
+		if (!Ini::Get().vaultEnabled) {
+			cosaveNote = "vault disabled in ini";
+		} else if (!a_data || a_len == 0) {
+			// Distinct from "unusable": there is nothing here to be damaged.
+			// Saying so is what keeps the report honest about which of the two
+			// copies the live state actually came from.
+			cosaveNote = "this save carries no SaveVault record";
+		} else {
+			s_status.cosaveOk = Decode(a_data, a_len,
+				fromCosave, cosaveTx, cosaveGt, cosaveDrops, cosaveNote);
+		}
+
+		Table         fromDisk;
+		std::uint64_t diskTx = 0;
+		double        diskGt = 0.0;
+		std::size_t   diskDrops = 0;
+		std::string   diskNote;
+
+		if (Ini::Get().vaultEnabled && !CharDir().empty()) {
+			const auto manifest = ReadManifest();
+			if (manifest.valid) {
+				std::vector<std::uint8_t> buffer;
+				std::string               readNote;
+				if (ReadFile(SlotPath(manifest.activeIsB), buffer, readNote)) {
+					s_status.diskOk = Decode(buffer.data(), buffer.size(),
+						fromDisk, diskTx, diskGt, diskDrops, diskNote);
+				} else {
+					diskNote = "slot unreadable: " + readNote;
+				}
+			} else {
+				diskNote = "no manifest";
+			}
+		}
+
+		s_status.cosaveTx = cosaveTx;
+		s_status.diskTx   = diskTx;
+
+		// ---- the ladder ------------------------------------------------------
+		// The co-save copy belongs to this exact .ess, so when both copies are
+		// readable it is the one that matches what is being loaded.  Disk is the
+		// fallback for the case the co-save exists to insure against: an .ess
+		// that cannot be read at all.
+		if (s_status.cosaveOk && !fromCosave.empty()) {
+			s_live   = std::move(fromCosave);
+			s_tx     = cosaveTx;
+			s_gameTime = cosaveGt;
+			s_status.source = Status::Source::kCosave;
+			if (s_status.diskOk && diskTx > cosaveTx) {
+				s_status.note = "disk holds a newer state (tx " +
+				                std::to_string(diskTx) + "); the loaded save is older, "
+				                "so the co-save state wins and disk is left untouched";
+			} else {
+				s_status.note = "co-save and disk agree";
+			}
+		} else if (s_status.diskOk && !fromDisk.empty()) {
+			s_live   = std::move(fromDisk);
+			s_tx     = diskTx;
+			s_gameTime = diskGt;
+			s_status.source = Status::Source::kDisk;
+			s_status.note   = "co-save unusable (" + cosaveNote +
+			                "); recovered tx " + std::to_string(diskTx) + " from disk";
+			spdlog::warn("[Vault] {}", s_status.note);
+		} else {
+			s_status.source = Status::Source::kNone;
+			s_status.note   = "no usable state (cosave: " + cosaveNote +
+			                "; disk: " + diskNote + ")";
+		}
+
+		s_status.droppedRecords = s_status.cosaveOk ? cosaveDrops : diskDrops;
+		s_committed = s_live;
+
+		const auto finished = std::chrono::steady_clock::now();
+		s_status.elapsedMs  = std::chrono::duration<double, std::milli>(finished - started).count();
+		s_status.entries    = s_live.size();
+
+		spdlog::info("[Vault] load: source={} tx={} entries={} dropped={} in {:.2f} ms",
+			static_cast<int>(s_status.source), s_tx, s_live.size(),
+			s_status.droppedRecords, s_status.elapsedMs);
+	}
+
+	void OnRevert(SKSE::SerializationInterface*)
+	{
+		Reset();
+	}
+
+	// -------------------------------------------------------------------------
+	void Reconcile()
+	{
+		s_status.formRefs   = 0;
+		s_status.tombstoned = 0;
+
+		std::vector<std::pair<std::string, std::string>> dead;
+		for (const auto& [key, entry] : s_live) {
+			if (entry.type != Type::kForm) {
+				continue;
+			}
+			++s_status.formRefs;
+			if (entry.form.Resolve()) {
+				continue;
+			}
+			++s_status.tombstoned;
+			if (dead.size() < 20) {
+				dead.emplace_back(key, entry.form.ToString());
+			}
+		}
+
+		if (s_status.tombstoned == 0) {
+			spdlog::info("[Vault] reconcile: {} form references all resolve", s_status.formRefs);
+			return;
+		}
+
+		spdlog::warn("[Vault] reconcile: {} of {} form references are tombstones",
+			s_status.tombstoned, s_status.formRefs);
+		for (const auto& [key, id] : dead) {
+			spdlog::warn("[Vault]   {} -> {} (missing)", key, id);
+		}
+	}
+}
+
