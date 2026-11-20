@@ -1,0 +1,49 @@
+name: build SaveDoctor
+
+# Standalone .ess repair tool: pure C++, no SKSE/CommonLib, static CRT.
+# Triggered by push to main. Publishes SSS-Ultra-SaveDoctor.exe to a Release
+# so it can be downloaded without a token.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S doctor -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Verify exe exists
+        shell: pwsh
+        run: |
+          $exe = "build/Release/SSS-Ultra-SaveDoctor.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          & $exe selftest
+          if ($LASTEXITCODE -ne 0) { throw "selftest failed" }
+
+      - name: Publish artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSS-Ultra-SaveDoctor
+          path: build/Release/SSS-Ultra-SaveDoctor.exe
+
+      - name: Publish to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: doctor-latest
+          name: SSS-Ultra-SaveDoctor (latest)
+          files: build/Release/SSS-Ultra-SaveDoctor.exe
+          body: |
+            Auto-built from `doctor/` on every push to main.
+            Fix: no longer deletes the `.skse` co-save (SkyUI MCM registrations).
