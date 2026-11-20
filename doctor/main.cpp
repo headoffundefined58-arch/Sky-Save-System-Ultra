@@ -232,12 +232,13 @@ int main(int a_argc, char** a_argv)
 					doctor::BuildWithBody(save, newBody, tmp);
 					fs::rename(tmp, e.path());
 
-					// Drop the co-save so SKSE starts clean.
-					auto cosavePath = e.path();
-					cosavePath.replace_extension("skse");
-					if (fs::exists(cosavePath, ec)) {
-						fs::remove(cosavePath, ec);
-					}
+					// NEVER delete the .skse co-save.  SkyUI's MCM menu
+					// registrations, MCM Helper state and every other SKSE
+					// plugin's serialised data live there.  Deleting it wipes
+					// all MCM menus.  Orphan records for removed plugins are
+					// ignored by SKSE automatically (no plugin claims their
+					// unique ID), so keeping the co-save is both safer and
+					// strictly cleaner than dropping it.
 					++repaired;
 					fixed.push_back(e.path().filename().string());
 				} catch (const std::exception& ex) {
@@ -321,13 +322,10 @@ int main(int a_argc, char** a_argv)
 		doctor::BuildWithBody(save, newBody, tmp);
 		fs::rename(tmp, savePath);
 
-		// Drop the co-save so SKSE starts clean (removes orphaned Papyrus state).
-		std::error_code ec;
-		auto cosavePath = savePath;
-		cosavePath.replace_extension("skse");
-		if (fs::exists(cosavePath, ec)) {
-			fs::remove(cosavePath, ec);
-		}
+		// NEVER delete the .skse co-save.  It holds SkyUI MCM registrations,
+		// MCM Helper state and all SKSE plugin serialised data.  Removing it
+		// makes every MCM menu vanish.  Orphan records for plugins that are no
+		// longer loaded are skipped by SKSE on load - no manual cleanup needed.
 
 		WriteStatus(dir, "OK " + savePath.filename().string());
 		return 0;
